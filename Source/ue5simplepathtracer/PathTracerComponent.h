@@ -4,6 +4,9 @@
 #include "Components/ActorComponent.h"
 #include "Components/PointLightComponent.h"
 #include "Engine/TextureRenderTarget2D.h"
+
+#include "PathTracerMaterialComponent.h"
+
 #include "PathTracerComponent.generated.h"
 
 DECLARE_LOG_CATEGORY_EXTERN(LogPathTracer, Log, All)
@@ -87,11 +90,16 @@ private:
     void SetupCamera();
     void GatherPointLights();
     void UpdateBatchSize(float PathTracingTime);
+    const UPathTracerMaterialComponent* GetMaterialProperties(const FHitResult& Hit);
     PathTracingRay GetCameraRay(float U, float V);
     FHitResult TraceRay(const PathTracingRay& Ray);
-    FLinearColor TracePixel(const PathTracingRay& Ray, int32 Depth);
-    FLinearColor CalculateLighting(const FVector& Position, const FVector& Normal, const FLinearColor& Albedo);
-    FLinearColor GetAlbedo(const FHitResult& Hit);
+    FLinearColor TracePixel(const PathTracingRay& Ray, int32 Depth, float& OutHitDistance);
+    FLinearColor CalculateLighting(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material);
+    FVector SampleHemisphere(const FVector& Normal, float Roughness);
+    float FresnelSchlick(float Cosine, float F0);
+    FVector Refract(const FVector& Incident, const FVector& Normal, float EtaI, float EtaT);
+    bool TotalInternalReflection(const FVector& Incident, const FVector& Normal, float EtaI, float EtaT);
+    FVector CalculateInterpolatedNormal(UStaticMeshComponent* MeshComponent, const FHitResult& Hit);
 
     TArray<FLinearColor> _AccumulatedLinearColor;
     TArray<FColor> _AccumulatedColor;
