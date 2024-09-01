@@ -22,6 +22,7 @@ void UPathTracerComponent::BeginPlay()
         _AccumulatedLinearColor.SetNum(Size.X * Size.Y);
         _AccumulatedColor.SetNum(Size.X * Size.Y);
         _SampleCounts.SetNum(Size.X * Size.Y);
+        _PixelVariance.SetNum(Size.X * Size.Y);
         _PID.MaxBatchSize = FMath::Min(RenderTarget->SizeX * RenderTarget->SizeY, _PID.MaxBatchSize);
 
         ResetRendering();
@@ -126,7 +127,8 @@ void UPathTracerComponent::RenderSceneProgressive()
                 _CurrentY = 0;
             }
 
-            PixelsToProcess.Add(FIntPoint(_CurrentX, _CurrentY));
+            if (_SampleCounts[_CurrentY * Size.X + _CurrentX] < SamplesPerPixel)
+                PixelsToProcess.Add(FIntPoint(_CurrentX, _CurrentY));
 
             _CurrentX++;
             if (_CurrentX >= Size.X)
@@ -141,24 +143,31 @@ void UPathTracerComponent::RenderSceneProgressive()
                 FIntPoint Pixel = PixelsToProcess[Index];
                 int32 PixelIndex = Pixel.Y * Size.X + Pixel.X;
 
-                float U = (Pixel.X + FMath::FRand()) / (float)Size.X;
-                float V = (Pixel.Y + FMath::FRand()) / (float)Size.Y;
-
-                PathTracingRay CameraRay = GetCameraRay(U, V);
-                float outHitDistance;
-                FLinearColor SampleColor = TracePixel(CameraRay, 0, outHitDistance);
+                int32 SamplesToTake = FMath::Max(1, FMath::RoundToInt(_PixelVariance[PixelIndex] * 10));
+                FLinearColor PixelColor = FLinearColor::Black;
+                for (int32 s = 0; s < 1; ++s)
+                {
+                    float U = (Pixel.X + FMath::FRand()) / (float)Size.X;
+                    float V = (Pixel.Y + FMath::FRand()) / (float)Size.Y;
+                    PathTracingRay CameraRay = GetCameraRay(U, V);
+                    float outHitDistance;
+                    PixelColor += TracePixel(CameraRay, 0, outHitDistance);
+                }
+                PixelColor /= SamplesToTake;
 
                 FCriticalSection CriticalSection;
                 {
                     FScopeLock Lock(&CriticalSection);
-                    _AccumulatedLinearColor[PixelIndex] += SampleColor;
-                    _SampleCounts[PixelIndex]++;
+                    FLinearColor OldMean = _AccumulatedLinearColor[PixelIndex] / _SampleCounts[PixelIndex];
+                    _AccumulatedLinearColor[PixelIndex] += PixelColor;
+                    _SampleCounts[PixelIndex] += SamplesToTake;
+                    FLinearColor NewMean = _AccumulatedLinearColor[PixelIndex] / _SampleCounts[PixelIndex];
+
+                    _PixelVariance[PixelIndex] = FVector::DistSquared((FVector)OldMean, (FVector)NewMean);
+                    _AccumulatedColor[PixelIndex] = NewMean.ToFColor(false);
                 }
 
-                FLinearColor AverageColor = _AccumulatedLinearColor[PixelIndex] / _SampleCounts[PixelIndex];
-                _AccumulatedColor[PixelIndex] = AverageColor.ToFColor(false);
-
-                FPlatformAtomics::InterlockedIncrement(&_RayCount);
+                FPlatformAtomics::InterlockedAdd(&_RayCount, SamplesToTake);
             });
     }
     double EndTime = FPlatformTime::Seconds();
@@ -168,22 +177,43 @@ void UPathTracerComponent::RenderSceneProgressive()
 
     if (RT)
     {
-        TArray<FColor>* ColorDataCopy = new TArray<FColor>(_AccumulatedColor);
+        
+        if (ShowSampleCount)
+        {
+            TArray<uint32>* ColorDataCopy = new TArray<uint32>(_SampleCounts);
+            ENQUEUE_RENDER_COMMAND(UpdateTextureCommand)(
+                [RT, ColorDataCopy, Size](FRHICommandListImmediate& RHICmdList)
+                {
+                    FUpdateTextureRegion2D Region(0, 0, 0, 0, Size.X, Size.Y);
+                    RHIUpdateTexture2D(
+                        RT->GetRenderTargetTexture(),
+                        0,
+                        Region,
+                        Size.X * 4,
+                        (uint8*)ColorDataCopy->GetData()
+                    );
 
-        ENQUEUE_RENDER_COMMAND(UpdateTextureCommand)(
-            [RT, ColorDataCopy, Size](FRHICommandListImmediate& RHICmdList)
-            {
-                FUpdateTextureRegion2D Region(0, 0, 0, 0, Size.X, Size.Y);
-                RHIUpdateTexture2D(
-                    RT->GetRenderTargetTexture(),
-                    0,
-                    Region,
-                    Size.X * 4,
-                    (uint8*)ColorDataCopy->GetData()
-                );
+                    delete ColorDataCopy;
+                });
+        }
+        else
+        {
+            TArray<FColor>* ColorDataCopy = new TArray<FColor>(_AccumulatedColor);
+            ENQUEUE_RENDER_COMMAND(UpdateTextureCommand)(
+                [RT, ColorDataCopy, Size](FRHICommandListImmediate& RHICmdList)
+                {
+                    FUpdateTextureRegion2D Region(0, 0, 0, 0, Size.X, Size.Y);
+                    RHIUpdateTexture2D(
+                        RT->GetRenderTargetTexture(),
+                        0,
+                        Region,
+                        Size.X * 4,
+                        (uint8*)ColorDataCopy->GetData()
+                    );
 
-                delete ColorDataCopy;
-            });
+                    delete ColorDataCopy;
+                });
+        }        
     }
 
     double ProgressPercentage = (double)(_SampleCounts[Size.X * Size.Y - 1]) / SamplesPerPixel * 100.0f;
@@ -266,22 +296,18 @@ FLinearColor UPathTracerComponent::TracePixel(const PathTracingRay& Ray, int32 D
     if (Depth >= MaxBounces)
         return FLinearColor::Black;
 
+    if (Depth >= RussianRouletteStartDepth)
+    {
+        if (FMath::FRand() > RussianRouletteProbability)
+            return FLinearColor::Black;
+    }
+
     FHitResult Hit = TraceRay(Ray);
     OutHitDistance = Hit.Distance;
 
     if (Hit.bBlockingHit)
     {
         FVector HitNormal = Hit.Normal;
-
-        if (ShowNormals)
-            return FLinearColor(HitNormal * 0.5f + 0.5f);
-
-        if (ShowDepth)
-        {
-            float NormalizedDepth = FMath::Clamp(Hit.Distance / 1000.0f, 0.0f, 1.0f);
-            return FLinearColor(1.0f - NormalizedDepth, 1.0f - NormalizedDepth, 1.0f - NormalizedDepth);
-        }
-
         const UPathTracerMaterialComponent* Material = GetMaterialProperties(Hit);
 
         if (!Material)
@@ -296,62 +322,177 @@ FLinearColor UPathTracerComponent::TracePixel(const PathTracingRay& Ray, int32 D
             }
         }
 
+        if (ShowNormals)
+            return FLinearColor(HitNormal * 0.5f + 0.5f);
+
+        if (ShowDepth)
+        {
+            float NormalizedDepth = FMath::Clamp(Hit.Distance / 1000.0f, 0.0f, 1.0f);
+            return FLinearColor(1.0f - NormalizedDepth, 1.0f - NormalizedDepth, 1.0f - NormalizedDepth);
+        }
+
         if (ShowAlbedo)
             return Material->Albedo;
 
-        if (ShowLightContribution)
-            return CalculateLighting(Hit.Location, HitNormal, -Ray.Direction, Material);
-
         FVector ViewDirection = -Ray.Direction;
-        float CosTheta = FMath::Max(FVector::DotProduct(HitNormal, ViewDirection), 0.0f);
-        float FresnelFactor = FresnelSchlick(CosTheta, Material->Specular);
 
-        FLinearColor DirectLighting = CalculateLighting(Hit.Location, HitNormal, ViewDirection, Material);
-        FLinearColor IndirectLighting = FLinearColor::Black;
+        FLinearColor DirectLighting = CalculateDirectLighting(Hit.Location, HitNormal, ViewDirection, Material);
 
-        FVector ReflectionDirection = Ray.Direction - 2 * FVector::DotProduct(Ray.Direction, HitNormal) * HitNormal;
-        PathTracingRay ReflectionRay = { Hit.Location + HitNormal * 0.001f, ReflectionDirection };
-        float ReflectionHitDistance;
-        FLinearColor ReflectionColor = TracePixel(ReflectionRay, Depth + 1, ReflectionHitDistance);
+        if (ShowLightContribution)
+            return DirectLighting;
 
-        if (Material->Translucency > 0.0f)
+        FLinearColor IndirectLighting = CalculateIndirectLighting(Hit, HitNormal, Ray, Material, Depth);
+
+        if (Depth >= RussianRouletteStartDepth)
         {
-            float EtaI = 1.0f; // Air
-            float EtaT = Material->IndexOfRefraction;
-            FVector Normal = HitNormal;
-
-            if (FVector::DotProduct(Ray.Direction, HitNormal) > 0.0f)
-            {
-                // Ray is exiting the material
-                Swap(EtaI, EtaT);
-                Normal = -Normal;
-            }
-
-            if (!TotalInternalReflection(Ray.Direction, Normal, EtaI, EtaT))
-            {
-                FVector RefractionDirection = Refract(Ray.Direction, Normal, EtaI, EtaT);
-                PathTracingRay RefractionRay = { Hit.Location - Normal * 0.001f, RefractionDirection };
-                float RefractionHitDistance;
-                FLinearColor RefractionColor = TracePixel(RefractionRay, Depth + 1, RefractionHitDistance);
-
-                // Blend reflection and refraction based on Fresnel factor and translucency
-                IndirectLighting = FMath::Lerp(RefractionColor, ReflectionColor, FresnelFactor) * Material->Translucency;
-            }
-            else
-            {
-                // Total internal reflection
-                IndirectLighting = ReflectionColor * Material->Translucency;
-            }
-        }
-        else
-        {
-            IndirectLighting = ReflectionColor;
+            IndirectLighting /= RussianRouletteProbability;
         }
 
-        return DirectLighting + IndirectLighting * Material->Albedo;
+        FLinearColor FinalColor = DirectLighting + IndirectLighting;
+        const float MaxLuminance = 100.0f;
+        float Luminance = FinalColor.GetLuminance();
+        if (Luminance > MaxLuminance)
+        {
+            FinalColor *= MaxLuminance / Luminance;
+        }
+
+        return FinalColor;
     }
 
-    // Environment lighting (simple sky color)
+    return CalculateEnvironmentLighting(Ray);
+}
+
+FLinearColor UPathTracerComponent::CalculateDirectLighting(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material)
+{
+    FLinearColor TotalDirectLighting = FLinearColor::Black;
+
+    for (const UPointLightComponent* Light : _PointLights)
+    {
+        TotalDirectLighting += CalculatePointLightContribution(Position, Normal, ViewDirection, Material, Light);
+    }
+
+    return TotalDirectLighting;
+}
+
+FLinearColor UPathTracerComponent::CalculatePointLightContribution(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material, const UPointLightComponent* Light)
+{
+    FVector LightDirection = (Light->GetLightPosition() - Position).GetSafeNormal();
+    float NdotL = FMath::Max(0.0f, FVector::DotProduct(Normal, LightDirection));
+
+    if (IsInShadow(Position, Light))
+        return FLinearColor::Black;
+
+    float Distance = FVector::Distance(Light->GetLightPosition(), Position);
+    float Attenuation = CalculateAttenuation(Distance);
+
+    FLinearColor DiffuseContribution = CalculateDiffuseContribution(Material, NdotL);
+    FLinearColor SpecularContribution = CalculateSpecularContribution(Normal, ViewDirection, LightDirection, Material);
+
+    return (DiffuseContribution + SpecularContribution) * Light->GetLightColor() * Light->Intensity * Attenuation;
+}
+
+bool UPathTracerComponent::IsInShadow(const FVector& Position, const UPointLightComponent* Light)
+{
+    FHitResult ShadowHit;
+    FVector ShadowRayOrigin = Position + FVector::UpVector * 0.001f; // Offset to avoid self-intersection
+    FVector ShadowRayEnd = Light->GetLightPosition();
+    GetWorld()->LineTraceSingleByChannel(ShadowHit, ShadowRayOrigin, ShadowRayEnd, ECC_Visibility);
+
+    return ShadowHit.bBlockingHit && ShadowHit.GetActor() != Light->GetOwner();
+}
+
+float UPathTracerComponent::CalculateAttenuation(float Distance)
+{
+    return 1.0f / (1.0f + 0.1f * Distance + 0.01f * Distance * Distance);
+}
+
+FLinearColor UPathTracerComponent::CalculateDiffuseContribution(const UPathTracerMaterialComponent* Material, float NdotL)
+{
+    return Material->Albedo * NdotL;
+}
+
+FLinearColor UPathTracerComponent::CalculateSpecularContribution(const FVector& Normal, const FVector& ViewDirection, const FVector& LightDirection, const UPathTracerMaterialComponent* Material)
+{
+    FVector HalfVector = (ViewDirection + LightDirection).GetSafeNormal();
+    float NdotH = FMath::Max(0.0f, FVector::DotProduct(Normal, HalfVector));
+    float SpecularPower = FMath::Pow(2.0f, (1.0f - Material->Roughness) * 11.0f + 1.0f);
+    return FLinearColor::White * FMath::Pow(NdotH, SpecularPower) * Material->Specular;
+}
+
+FLinearColor UPathTracerComponent::CalculateIndirectLighting(const FHitResult& Hit, const FVector& Normal, const PathTracingRay& Ray, const UPathTracerMaterialComponent* Material, int32 Depth)
+{
+    FLinearColor IndirectLighting = FLinearColor::Black;
+    FVector ViewDirection = -Ray.Direction;
+
+    float CosTheta = FMath::Max(FVector::DotProduct(Normal, ViewDirection), 0.0f);
+    float FresnelFactor = FresnelSchlick(CosTheta, Material->Specular);
+
+    FLinearColor ReflectionColor = CalculateReflection(Hit, Normal, Ray, Depth);
+    FLinearColor RefractionColor = CalculateRefraction(Hit, Normal, Ray, Material, Depth);
+    FLinearColor DiffuseColor = CalculateDiffuseReflection(Hit, Normal, Material, Depth);
+
+    float MetallicFactor = Material->Metallic;
+    float DiffuseFactor = 1.0f - MetallicFactor;
+
+    IndirectLighting = (ReflectionColor * FresnelFactor * MetallicFactor) +
+        (RefractionColor * Material->Translucency) +
+        (DiffuseColor * Material->Albedo * DiffuseFactor * (1.0f - Material->Translucency));
+
+    // Apply emission
+    IndirectLighting += Material->Albedo * Material->Emission;
+
+    return IndirectLighting;
+}
+
+FLinearColor UPathTracerComponent::CalculateReflection(const FHitResult& Hit, const FVector& Normal, const PathTracingRay& Ray, int32 Depth)
+{
+    FVector ReflectionDirection = Ray.Direction - 2 * FVector::DotProduct(Ray.Direction, Normal) * Normal;
+    PathTracingRay ReflectionRay = { Hit.Location + Normal * 0.001f, ReflectionDirection };
+    float ReflectionHitDistance;
+    return TracePixel(ReflectionRay, Depth + 1, ReflectionHitDistance);
+}
+
+FLinearColor UPathTracerComponent::CalculateRefraction(const FHitResult& Hit, const FVector& Normal, const PathTracingRay& Ray, const UPathTracerMaterialComponent* Material, int32 Depth)
+{
+    if (Material->Translucency <= 0.0f)
+        return FLinearColor::Black;
+
+    float EtaI = 1.0f; // Air
+    float EtaT = Material->IndexOfRefraction;
+    FVector TranslucencyNormal = Normal;
+
+    if (FVector::DotProduct(Ray.Direction, Normal) > 0.0f)
+    {
+        // Ray is exiting the material
+        Swap(EtaI, EtaT);
+        TranslucencyNormal = -Normal;
+    }
+
+    if (!TotalInternalReflection(Ray.Direction, TranslucencyNormal, EtaI, EtaT))
+    {
+        FVector RefractionDirection = Refract(Ray.Direction, TranslucencyNormal, EtaI, EtaT);
+        PathTracingRay RefractionRay = { Hit.Location - TranslucencyNormal * 0.001f, RefractionDirection };
+        float RefractionHitDistance;
+        return TracePixel(RefractionRay, Depth + 1, RefractionHitDistance);
+    }
+    else
+    {
+        // Total internal reflection, use reflection
+        return CalculateReflection(Hit, Normal, Ray, Depth);
+    }
+}
+
+FLinearColor UPathTracerComponent::CalculateDiffuseReflection(const FHitResult& Hit, const FVector& Normal, const UPathTracerMaterialComponent* Material, int32 Depth)
+{
+    FVector DiffuseDirection = SampleHemisphere(Normal, Material->Roughness);
+    PathTracingRay DiffuseRay = { Hit.Location + Normal * 0.001f, DiffuseDirection };
+    float DiffuseHitDistance;
+    return TracePixel(DiffuseRay, Depth + 1, DiffuseHitDistance);
+}
+
+FLinearColor UPathTracerComponent::CalculateEnvironmentLighting(const PathTracingRay& Ray)
+{
+    // Simple sky color
     float T = 0.5f * (Ray.Direction.Z + 1.0f);
     return FLinearColor::LerpUsingHSV(FLinearColor(1.0f, 1.0f, 1.0f), FLinearColor(0.5f, 0.7f, 1.0f), T);
 }
@@ -375,32 +516,6 @@ bool UPathTracerComponent::TotalInternalReflection(const FVector& Incident, cons
     float CosI = -FVector::DotProduct(Normal, Incident);
     float SinT2 = Eta * Eta * (1.0f - CosI * CosI);
     return SinT2 > 1.0f;
-}
-
-FLinearColor UPathTracerComponent::CalculateLighting(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material)
-{
-    FLinearColor TotalLighting = FLinearColor::Black;
-
-    for (const UPointLightComponent* Light : _PointLights)
-    {
-        FVector LightDirection = (Light->GetLightPosition() - Position).GetSafeNormal();
-        float NdotL = FMath::Max(0.0f, FVector::DotProduct(Normal, LightDirection));
-
-        float Distance = FVector::Distance(Light->GetLightPosition(), Position);
-        float Attenuation = 1.0f / (1.0f + 0.1f * Distance + 0.01f * Distance * Distance);
-
-        FLinearColor DiffuseContribution = Material->Albedo * NdotL;
-
-        FVector HalfVector = (ViewDirection + LightDirection).GetSafeNormal();
-        float NdotH = FMath::Max(0.0f, FVector::DotProduct(Normal, HalfVector));
-        float SpecularPower = FMath::Pow(2.0f, (1.0f - Material->Roughness) * 11.0f + 1.0f);
-        FLinearColor SpecularContribution = FLinearColor::White * FMath::Pow(NdotH, SpecularPower) * Material->Specular;
-
-        FLinearColor LightContribution = (DiffuseContribution + SpecularContribution) * Light->GetLightColor() * Light->Intensity * Attenuation;
-        TotalLighting += LightContribution;
-    }
-
-    return TotalLighting;
 }
 
 FVector UPathTracerComponent::SampleHemisphere(const FVector& Normal, float Roughness)

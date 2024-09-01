@@ -65,6 +65,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
     float FrameTimeBudget = 1.0f / 60.0f;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
+    float RussianRouletteStartDepth = 3;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
+    float RussianRouletteProbability = 0.5f;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer Debug")
     bool ShowNormals = false;
 
@@ -76,6 +82,9 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer Debug")
     bool ShowLightContribution = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer Debug")
+    bool ShowSampleCount = false;
 
     UFUNCTION(BlueprintCallable, Category = "Path Tracer")
     void RenderSceneProgressive();
@@ -93,8 +102,22 @@ private:
     const UPathTracerMaterialComponent* GetMaterialProperties(const FHitResult& Hit);
     PathTracingRay GetCameraRay(float U, float V);
     FHitResult TraceRay(const PathTracingRay& Ray);
+
     FLinearColor TracePixel(const PathTracingRay& Ray, int32 Depth, float& OutHitDistance);
-    FLinearColor CalculateLighting(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material);
+    FLinearColor CalculateDirectLighting(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material);
+    FLinearColor CalculateIndirectLighting(const FHitResult& Hit, const FVector& Normal, const PathTracingRay& Ray, const UPathTracerMaterialComponent* Material, int32 Depth);
+
+    FLinearColor CalculatePointLightContribution(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material, const UPointLightComponent* Light);
+    bool IsInShadow(const FVector& Position, const UPointLightComponent* Light);
+    float CalculateAttenuation(float Distance);
+    FLinearColor CalculateDiffuseContribution(const UPathTracerMaterialComponent* Material, float NdotL);
+    FLinearColor CalculateSpecularContribution(const FVector& Normal, const FVector& ViewDirection, const FVector& LightDirection, const UPathTracerMaterialComponent* Material);
+
+    FLinearColor CalculateReflection(const FHitResult& Hit, const FVector& Normal, const PathTracingRay& Ray, int32 Depth);
+    FLinearColor CalculateRefraction(const FHitResult& Hit, const FVector& Normal, const PathTracingRay& Ray, const UPathTracerMaterialComponent* Material, int32 Depth);
+    FLinearColor CalculateDiffuseReflection(const FHitResult& Hit, const FVector& Normal, const UPathTracerMaterialComponent* Material, int32 Depth);
+
+    FLinearColor CalculateEnvironmentLighting(const PathTracingRay& Ray);
     FVector SampleHemisphere(const FVector& Normal, float Roughness);
     float FresnelSchlick(float Cosine, float F0);
     FVector Refract(const FVector& Incident, const FVector& Normal, float EtaI, float EtaT);
@@ -115,4 +138,6 @@ private:
     PathTracingCamera _Camera;
 
     PathTracingPID _PID;
+
+    TArray<float> _PixelVariance;
 };
