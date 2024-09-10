@@ -45,16 +45,16 @@ public:
         float Kd = 0.005f;
         float IntegralError = 0.0f;
         float LastError = 0.0f;
-        float MovingAverageTime = 1.f / 60.f;
-        int32 FrameCount = 0;
-        int32 WarmupFrames = 600;
-        int32 MinBatchSize = 1000;
-        int32 MaxBatchSize = 1000000;
-        int32 CurrBatchSize = 50000;
+        float MovingAverageTime = 1.f / 120.f;
+        int64 FrameCount = 0;
+        int64 WarmupFrames = 60;
+        int64 MinBatchSize = 1000;
+        int64 MaxBatchSize = 50000;
+        int64 CurrBatchSize = 5000;
     };
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
-    UTextureRenderTarget2D* RenderTarget;
+    UMaterialInterface* PathTracerMaterial;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
     int32 MaxBounces = 5;
@@ -63,7 +63,13 @@ public:
     int32 SamplesPerPixel = 10;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
-    float FrameTimeBudget = 1.0f / 60.0f;
+    float FrameTimeBudget = 1.0f / 120.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
+    int32 FramesBeforeStartingRender = 10;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
+    bool AdaptiveSampling = true;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Path Tracer")
     float RussianRouletteStartDepth = 3;
@@ -90,7 +96,7 @@ public:
     void RenderSceneProgressive();
 
     UFUNCTION(BlueprintCallable, Category = "Path Tracer")
-    void ResetRendering();
+    void ResetFrameCounter();
 
     virtual void BeginPlay() override;
     virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
@@ -102,6 +108,8 @@ private:
     const UPathTracerMaterialComponent* GetMaterialProperties(const FHitResult& Hit);
     PathTracingRay GetCameraRay(float U, float V);
     FHitResult TraceRay(const PathTracingRay& Ray);
+    void ResetMaps();
+    void ResetRendering();
 
     FLinearColor TracePixel(const PathTracingRay& Ray, int32 Depth, float& OutHitDistance);
     FLinearColor CalculateDirectLighting(const FVector& Position, const FVector& Normal, const FVector& ViewDirection, const UPathTracerMaterialComponent* Material);
@@ -123,21 +131,21 @@ private:
     FVector Refract(const FVector& Incident, const FVector& Normal, float EtaI, float EtaT);
     bool TotalInternalReflection(const FVector& Incident, const FVector& Normal, float EtaI, float EtaT);
     FVector CalculateInterpolatedNormal(UStaticMeshComponent* MeshComponent, const FHitResult& Hit);
+    
+    UTextureRenderTarget2D* _RenderTarget;
+    UMaterialInstanceDynamic* _PathTracerMaterialInstance;
 
     TArray<FLinearColor> _AccumulatedLinearColor;
     TArray<FColor> _AccumulatedColor;
     TArray<int32> _SampleCounts;
+    TArray<float> _PixelVariance;
+
     TArray<UPointLightComponent*> _PointLights;
-
-    int32 _CurrentX = 0;
-    int32 _CurrentY = 0;
-    bool _IsFrameComplete = false;
-
     int32 _RayCount = 0;
-
+    int64 _CurrentTotalSampleCount = 0;
+    int64 _TargetTotalSampleCount = 0;
     PathTracingCamera _Camera;
 
     PathTracingPID _PID;
-
-    TArray<float> _PixelVariance;
+    int64 _FrameCount = 0;
 };

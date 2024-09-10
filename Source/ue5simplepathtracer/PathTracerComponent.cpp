@@ -2,7 +2,7 @@
 #include "Engine/World.h"
 #include "Camera/CameraComponent.h"
 #include "Kismet/GameplayStatics.h"
-
+#include "Kismet/KismetRenderingLibrary.h"
 
 DEFINE_LOG_CATEGORY(LogPathTracer)
 
@@ -15,24 +15,23 @@ void UPathTracerComponent::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (RenderTarget)
+    if (PathTracerMaterial)
     {
-        FRenderTarget* RT = RenderTarget->GameThread_GetRenderTargetResource();
-        FIntPoint Size = RT->GetSizeXY();
-        _AccumulatedLinearColor.SetNum(Size.X * Size.Y);
-        _AccumulatedColor.SetNum(Size.X * Size.Y);
-        _SampleCounts.SetNum(Size.X * Size.Y);
-        _PixelVariance.SetNum(Size.X * Size.Y);
-        _PID.MaxBatchSize = FMath::Min(RenderTarget->SizeX * RenderTarget->SizeY, _PID.MaxBatchSize);
-
-        ResetRendering();
-
-        UE_LOG(LogPathTracer, Log, TEXT("Initialized render target of size %dx%d"), Size.X, Size.Y);
+        _PathTracerMaterialInstance = UMaterialInstanceDynamic::Create(PathTracerMaterial, this);
+        APlayerCameraManager* CameraManager = UGameplayStatics::GetPlayerCameraManager(GetWorld(), 0);
+        UCameraComponent* CameraComponent = CameraManager->GetViewTarget()->FindComponentByClass<UCameraComponent>();
+        CameraComponent->AddOrUpdateBlendable(_PathTracerMaterialInstance);
     }
     else
     {
-        UE_LOG(LogPathTracer, Error, TEXT("No render target"));
+        UE_LOG(LogPathTracer, Error, TEXT("No Path Tracing Material"));
     }
+
+    FVector2D ViewportSize;
+    GEngine->GameViewport->GetViewportSize(ViewportSize);
+    _RenderTarget = NewObject<UTextureRenderTarget2D>(GetWorld());
+    _RenderTarget->InitCustomFormat(1, 1, PF_B8G8R8A8, true);
+    _RenderTarget->UpdateResource();    
 
     GatherPointLights();
 }
@@ -40,7 +39,16 @@ void UPathTracerComponent::BeginPlay()
 void UPathTracerComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-    RenderSceneProgressive();
+
+    if (_FrameCount == FramesBeforeStartingRender)
+    {
+        ResetRendering();
+    }
+    else if (_FrameCount > FramesBeforeStartingRender)
+    {
+        RenderSceneProgressive();
+    }
+    _FrameCount++;
 }
 
 void UPathTracerComponent::GatherPointLights()
@@ -101,12 +109,15 @@ const UPathTracerMaterialComponent* UPathTracerComponent::GetMaterialProperties(
 
 void UPathTracerComponent::RenderSceneProgressive()
 {
-    _RayCount = 0;
-
-    if (!RenderTarget || _IsFrameComplete)
+    if (!_RenderTarget)
         return;
 
-    FRenderTarget* RT = RenderTarget->GameThread_GetRenderTargetResource();
+    _RayCount = 0;
+
+    FRenderTarget* RT = _RenderTarget->GameThread_GetRenderTargetResource();
+    if (!RT)
+        return;
+
     FIntPoint Size = RT->GetSizeXY();
 
     TArray<FIntPoint> PixelsToProcess;
@@ -116,26 +127,11 @@ void UPathTracerComponent::RenderSceneProgressive()
     {
         for (int32 i = 0; i < _PID.CurrBatchSize; ++i)
         {
-            if (_CurrentY >= Size.Y)
-            {
-                if (_SampleCounts[Size.X * Size.Y - 1] >= SamplesPerPixel)
-                {
-                    _IsFrameComplete = true;
-                    break;
-                }
-                _CurrentX = 0;
-                _CurrentY = 0;
-            }
+            int32 CurrentX = FMath::RandRange(0, Size.X - 1);
+            int32 CurrentY = FMath::RandRange(0, Size.Y - 1);
 
-            if (_SampleCounts[_CurrentY * Size.X + _CurrentX] < SamplesPerPixel)
-                PixelsToProcess.Add(FIntPoint(_CurrentX, _CurrentY));
-
-            _CurrentX++;
-            if (_CurrentX >= Size.X)
-            {
-                _CurrentX = 0;
-                _CurrentY++;
-            }
+            if (_SampleCounts[CurrentY * Size.X + CurrentX] < SamplesPerPixel)
+                PixelsToProcess.Add(FIntPoint(CurrentX, CurrentY));
         }
 
         ParallelFor(PixelsToProcess.Num(), [&](int32 Index)
@@ -143,9 +139,9 @@ void UPathTracerComponent::RenderSceneProgressive()
                 FIntPoint Pixel = PixelsToProcess[Index];
                 int32 PixelIndex = Pixel.Y * Size.X + Pixel.X;
 
-                int32 SamplesToTake = FMath::Max(1, FMath::RoundToInt(_PixelVariance[PixelIndex] * 10));
+                int32 SamplesToTake = AdaptiveSampling ? FMath::Max(1, FMath::RoundToInt(_PixelVariance[PixelIndex] * 10)) : 1;
                 FLinearColor PixelColor = FLinearColor::Black;
-                for (int32 s = 0; s < 1; ++s)
+                for (int32 s = 0; s < SamplesToTake; ++s)
                 {
                     float U = (Pixel.X + FMath::FRand()) / (float)Size.X;
                     float V = (Pixel.Y + FMath::FRand()) / (float)Size.Y;
@@ -161,6 +157,7 @@ void UPathTracerComponent::RenderSceneProgressive()
                     FLinearColor OldMean = _AccumulatedLinearColor[PixelIndex] / _SampleCounts[PixelIndex];
                     _AccumulatedLinearColor[PixelIndex] += PixelColor;
                     _SampleCounts[PixelIndex] += SamplesToTake;
+                    _CurrentTotalSampleCount += SamplesToTake;
                     FLinearColor NewMean = _AccumulatedLinearColor[PixelIndex] / _SampleCounts[PixelIndex];
 
                     _PixelVariance[PixelIndex] = FVector::DistSquared((FVector)OldMean, (FVector)NewMean);
@@ -216,27 +213,16 @@ void UPathTracerComponent::RenderSceneProgressive()
         }        
     }
 
-    double ProgressPercentage = (double)(_SampleCounts[Size.X * Size.Y - 1]) / SamplesPerPixel * 100.0f;
+    double Progress = (double)(_CurrentTotalSampleCount) / (double)(_TargetTotalSampleCount);
+    _PathTracerMaterialInstance->SetScalarParameterValue("BlendFactor", FMath::Min(Progress * 5, 1));
+    double ProgressPercentage = Progress * 100;
     UE_LOG(LogPathTracer, Log, TEXT("Progress %.2f%%, Pixel Batch Size %d, Path Tracing Time %.4f s, Moving Average %.4f s"), ProgressPercentage, _PID.CurrBatchSize, PathTracingTime, _PID.MovingAverageTime);
 }
 
 void UPathTracerComponent::ResetRendering()
 {
+    ResetMaps();
     SetupCamera();
-    if (RenderTarget)
-    {
-        FRenderTarget* RT = RenderTarget->GameThread_GetRenderTargetResource();
-        FIntPoint Size = RT->GetSizeXY();
-        for (int32 i = 0; i < _AccumulatedLinearColor.Num(); ++i)
-        {
-            _AccumulatedLinearColor[i] = FLinearColor::Black;
-            _AccumulatedColor[i] = FColor::Black;
-            _SampleCounts[i] = 0;
-        }
-    }
-    _CurrentX = 0;
-    _CurrentY = 0;
-    _IsFrameComplete = false;
 
     UE_LOG(LogPathTracer, Log, TEXT("Rendering reset"));
 }
@@ -257,11 +243,14 @@ void UPathTracerComponent::SetupCamera()
         return;
     }
 
+    float AspectRatio = (float)_RenderTarget->SizeX / (float)_RenderTarget->SizeY;
+    CameraComponent->SetAspectRatio(AspectRatio);
+
     _Camera.CameraLocation = CameraComponent->GetComponentLocation();
     _Camera.CameraRotation = CameraComponent->GetComponentRotation();
 
     _Camera.FOV = CameraComponent->FieldOfView;
-    _Camera.AspectRatio = CameraComponent->AspectRatio;
+    _Camera.AspectRatio = AspectRatio;
 
     _Camera.Forward = _Camera.CameraRotation.Vector();
     _Camera.Right = FVector::CrossProduct(_Camera.Forward, FVector::UpVector);
@@ -438,7 +427,6 @@ FLinearColor UPathTracerComponent::CalculateIndirectLighting(const FHitResult& H
         (RefractionColor * Material->Translucency) +
         (DiffuseColor * Material->Albedo * DiffuseFactor * (1.0f - Material->Translucency));
 
-    // Apply emission
     IndirectLighting += Material->Albedo * Material->Emission;
 
     return IndirectLighting;
@@ -463,7 +451,6 @@ FLinearColor UPathTracerComponent::CalculateRefraction(const FHitResult& Hit, co
 
     if (FVector::DotProduct(Ray.Direction, Normal) > 0.0f)
     {
-        // Ray is exiting the material
         Swap(EtaI, EtaT);
         TranslucencyNormal = -Normal;
     }
@@ -477,7 +464,6 @@ FLinearColor UPathTracerComponent::CalculateRefraction(const FHitResult& Hit, co
     }
     else
     {
-        // Total internal reflection, use reflection
         return CalculateReflection(Hit, Normal, Ray, Depth);
     }
 }
@@ -551,7 +537,6 @@ FVector UPathTracerComponent::CalculateInterpolatedNormal(UStaticMeshComponent* 
 
     FIndexArrayView Indices = LODModel.IndexBuffer.GetArrayView();
 
-    // Get the triangle vertices
     int32 TriangleIndex = Hit.FaceIndex * 3;
     FVector Vertices[3];
     FVector Normals[3];
@@ -562,19 +547,47 @@ FVector UPathTracerComponent::CalculateInterpolatedNormal(UStaticMeshComponent* 
         Normals[i] = (FVector)LODModel.VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ(VertexIndex);
     }
 
-    // Calculate barycentric coordinates
     FVector LocalHitLocation = MeshComponent->GetComponentTransform().InverseTransformPosition(Hit.Location);
     FVector BarycentricCoord = FMath::ComputeBaryCentric2D(LocalHitLocation, Vertices[0], Vertices[1], Vertices[2]);
 
-    // Interpolate normals using barycentric coordinates
-    FVector InterpolatedNormal =
-        Normals[0] * BarycentricCoord.X +
-        Normals[1] * BarycentricCoord.Y +
-        Normals[2] * BarycentricCoord.Z;
+    FVector InterpolatedNormal = Normals[0] * BarycentricCoord.X + Normals[1] * BarycentricCoord.Y +  Normals[2] * BarycentricCoord.Z;
 
-    // Transform the normal to world space
     InterpolatedNormal = MeshComponent->GetComponentTransform().TransformVector(InterpolatedNormal);
     InterpolatedNormal.Normalize();
 
     return InterpolatedNormal;
+}
+
+void UPathTracerComponent::ResetMaps()
+{
+    FVector2D ViewportSizeTemp;
+    GEngine->GameViewport->GetViewportSize(ViewportSizeTemp);
+    FInt32Point ViewportSize = { (int32)ViewportSizeTemp.X, (int32)ViewportSizeTemp.Y };
+    _RenderTarget->ResizeTarget(ViewportSize.X, ViewportSize.Y);
+    _RenderTarget->UpdateResource();
+    _PathTracerMaterialInstance->SetTextureParameterValue("PathTracerRenderTarget", _RenderTarget);
+
+    int64 PixelCount = (int64)ViewportSize.X * (int64)ViewportSize.Y;
+    _AccumulatedLinearColor.SetNumUninitialized(PixelCount);
+    _AccumulatedColor.SetNumUninitialized(PixelCount);
+    _SampleCounts.SetNumUninitialized(PixelCount);
+    _PixelVariance.SetNumUninitialized(PixelCount);
+
+    for (int64 i = 0; i < PixelCount; i++)
+    {
+        _AccumulatedLinearColor[i] = FLinearColor::Transparent;
+        _AccumulatedColor[i] = FColor::Transparent;
+        _SampleCounts[i] = 0;
+        _PixelVariance[i] = 0;
+    }
+
+    _CurrentTotalSampleCount = 0;
+    _TargetTotalSampleCount = PixelCount * SamplesPerPixel;
+}
+
+void UPathTracerComponent::ResetFrameCounter()
+{
+    _FrameCount = 0;
+    _CurrentTotalSampleCount = 0;
+    _PathTracerMaterialInstance->SetScalarParameterValue("BlendFactor", 0);
 }
