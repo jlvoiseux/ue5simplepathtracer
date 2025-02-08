@@ -13,3 +13,7 @@ in order to benefit from the scene edition capabilities of the latter.
 <img width="958" alt="Screenshot 2025-02-08 182952" src="https://github.com/user-attachments/assets/1e33ad89-a4a3-4d34-9bd3-04fe5618d291" />
 
 ![ue5-path-tracer](https://github.com/user-attachments/assets/005a11be-4fcf-4241-8e27-5744a7c311a3)
+
+## References
+- Stanford Bunny, Dragon: http://graphics.stanford.edu/data/3Dscanrep/
+- Utah Teapot: https://graphics.cs.utah.edu/courses/cs6620/fall2013/?prj=5
